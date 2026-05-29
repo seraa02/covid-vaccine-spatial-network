@@ -1,0 +1,910 @@
+---
+title: "Improving Vaccine Distribution with Graph Networks"
+author: "STAT 636 Final Project "
+date: "`r Sys.Date()`"
+runtime: shiny
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Step 0 – Libraries and Options
+
+```{r libraries}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(sf)
+library(tigris)
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(shiny)
+library(leaflet)
+library(DT)
+
+options(tigris_use_cache = TRUE, tigris_class = "sf")
+```
+
+# Step 1 – Import and Clean CDC Vaccination Data
+
+## Step 1.1 – Read the CSV
+
+```{r import-data}
+vax_raw <- read_csv("DATA.csv") %>%
+  clean_names()
+
+print("Raw vaccination data (first rows):")
+print(head(vax_raw))
+
+print("Column names:")
+print(names(vax_raw))
+```
+
+## Step 1.2 – Basic Cleaning and Latest Snapshot
+
+```{r clean-latest}
+vax <- vax_raw %>%
+  transmute(
+    date = mdy(date),                  # from "05/10/23" format
+    fips = str_pad(fips, 5, pad = "0"),
+    recip_county,
+    recip_state,
+    completeness_pct,
+    series_complete_pop_pct,
+    booster_doses_vax_pct,
+    svi_ctgy,
+    metro_status,
+    census2019,
+    census2019_5plus_pop,
+    census2019_18plus_pop,
+    census2019_65plus_pop
+  ) %>%
+  filter(!is.na(fips), !is.na(date))
+
+latest_date <- max(vax$date, na.rm = TRUE)
+latest_date
+
+vax_latest <- vax %>%
+  filter(date == latest_date)
+
+cat("Imported vaccination data with", nrow(vax_latest), "rows for", latest_date, "\n")
+print(head(vax_latest))
+```
+
+# Step 2 – Geographic Data (County Shapefiles)
+
+## Step 2.1 – Download and Prepare County Shapefiles
+
+```{r shapefiles}
+counties_sf <- counties(cb = TRUE, year = 2021) %>%
+  st_transform(4326) %>%
+  mutate(geoid = str_pad(GEOID, 5, pad = "0"))
+
+county_vax <- counties_sf %>%
+  left_join(vax_latest, by = c("geoid" = "fips"))
+
+cat("Merged shapefile and vaccination data; rows:", nrow(county_vax), "\n")
+cat("Rows with missing vaccination %:", sum(is.na(county_vax$series_complete_pop_pct)), "\n")
+```
+
+# Step 3 – Build County Adjacency Network
+
+## Step 3.1 – Compute Adjacency and Edge List
+
+```{r adjacency}
+adj_list <- st_touches(county_vax)
+
+edge_df <- purrr::map2_dfr(
+  .x = seq_along(adj_list),
+  .y = adj_list,
+  ~ tibble(
+    from = county_vax$geoid[.x],
+    to   = county_vax$geoid[.y]
+  )
+) %>%
+  filter(!is.na(from), !is.na(to), from != to) %>%
+  distinct()
+
+cat("Edges before filtering:", nrow(edge_df), "\n")
+
+vertices <- county_vax %>%
+  st_drop_geometry() %>%
+  transmute(
+    geoid = geoid,
+    name  = geoid,                 # igraph vertex id
+    recip_county,
+    recip_state,
+    date,
+    completeness_pct,
+    series_complete_pop_pct,
+    booster_doses_vax_pct,
+    svi_ctgy,
+    metro_status,
+    census2019,
+    census2019_5plus_pop,
+    census2019_18plus_pop,
+    census2019_65plus_pop
+  ) %>%
+  filter(!is.na(name)) %>%
+  distinct(name, .keep_all = TRUE)
+
+stopifnot(!anyDuplicated(vertices$name))
+
+edge_df <- edge_df %>%
+  filter(from %in% vertices$name, to %in% vertices$name)
+
+cat("Final vertices:", nrow(vertices), "\n")
+cat("Final edges:", nrow(edge_df), "\n")
+```
+
+## Step 3.2 – Build igraph / tidygraph Object
+
+```{r build-graph}
+g <- graph_from_data_frame(d = edge_df, vertices = vertices, directed = FALSE)
+print(g)
+
+g_tbl <- as_tbl_graph(g)
+print(g_tbl)
+```
+
+# Step 4 – Node Features and Neighbour Metrics
+
+## Step 4.1 – Create Node-Level Features
+
+```{r node-features}
+g_tbl <- g_tbl %>%
+  mutate(
+    vax_pct          = series_complete_pop_pct,
+    booster_pct      = booster_doses_vax_pct,
+    svi_category     = svi_ctgy,
+    metro_status     = metro_status,
+    pop_total        = census2019,
+    pop_5plus        = census2019_5plus_pop,
+    pop_18plus       = census2019_18plus_pop,
+    pop_65plus       = census2019_65plus_pop
+  )
+
+print("Node features (first rows):")
+g_tbl %>%
+  as_tibble() %>%
+  select(name, recip_county, recip_state, vax_pct, booster_pct, pop_total) %>%
+  head() %>%
+  print()
+```
+
+## Step 4.2 – Neighbour-Based Vaccination Metrics
+
+```{r neighbour-metrics}
+g_igraph <- as.igraph(g_tbl)
+
+vax_vec <- g_tbl %>% as_tibble() %>% pull(vax_pct)
+names(vax_vec) <- g_tbl %>% as_tibble() %>% pull(name)
+
+neigh_list <- ego(g_igraph, order = 1, nodes = V(g_igraph), mode = "all")
+
+neigh_mean_vax <- purrr::map_dbl(neigh_list, function(nb) {
+  ids <- names(nb)
+  mean(vax_vec[ids], na.rm = TRUE)
+})
+
+g_tbl <- g_tbl %>%
+  mutate(neighbour_mean_vax = neigh_mean_vax)
+
+print("Neighbour-based vaccination metrics (first rows):")
+g_tbl %>%
+  as_tibble() %>%
+  select(name, vax_pct, neighbour_mean_vax) %>%
+  head() %>%
+  print()
+```
+
+# Step 5 – Centrality and Community Structure
+
+## Step 5.1 – Centrality Metrics
+
+```{r centrality}
+g_tbl <- g_tbl %>%
+  mutate(
+    degree     = centrality_degree(),
+    betweenness = centrality_betweenness(),
+    closeness   = centrality_closeness()
+  )
+
+print("Centrality metrics (first rows):")
+g_tbl %>%
+  as_tibble() %>%
+  select(name, degree, betweenness, closeness) %>%
+  head() %>%
+  print()
+```
+
+## Step 5.2 – Community Detection (Louvain)
+
+```{r communities}
+g_tbl <- g_tbl %>%
+  mutate(community = as.factor(group_louvain()))
+
+print("Top communities by size:")
+g_tbl %>%
+  as_tibble() %>%
+  count(community) %>%
+  arrange(desc(n)) %>%
+  head() %>%
+  print()
+```
+
+## Step 5.3 – Network Statistics
+
+```{r stats}
+g_igraph <- as.igraph(g_tbl)
+
+graph_stats <- tibble(
+  num_vertices    = gorder(g_igraph),
+  num_edges       = gsize(g_igraph),
+  density         = edge_density(g_igraph),
+  diameter        = diameter(g_igraph, directed = FALSE, weights = NA),
+  avg_path_length = mean_distance(g_igraph, directed = FALSE),
+  num_components  = components(g_igraph)$no
+)
+
+print("Overall network statistics:")
+print(graph_stats)
+```
+
+# Step 6 – Join Graph Features Back to Geometry for Mapping
+
+```{r join-geometry}
+nodes_features <- g_tbl %>%
+  as_tibble() %>%
+  select(
+    name,
+    recip_county,
+    recip_state,
+    vax_pct,
+    booster_pct,
+    neighbour_mean_vax,
+    degree,
+    betweenness,
+    closeness,
+    svi_category,
+    metro_status,
+    pop_total,
+    pop_5plus,
+    pop_18plus,
+    pop_65plus,
+    community
+  )
+
+county_graph_sf <- county_vax %>%
+  left_join(nodes_features, by = c("geoid" = "name")) %>%
+  mutate(
+    recip_county = dplyr::coalesce(recip_county.x, recip_county.y),
+    recip_state  = dplyr::coalesce(recip_state.x,  recip_state.y)
+  ) %>%
+  select(
+    -recip_county.x, -recip_county.y,
+    -recip_state.x,  -recip_state.y
+  ) %>%
+  filter(!is.na(vax_pct))
+```
+
+# Step 7 – Export Clean Nodes and Edges for GNN
+
+```{r export-gnn}
+nodes_for_gnn <- nodes_features %>%
+  rename(node_id = name)
+
+edges_for_gnn <- edge_df %>%
+  transmute(
+    src = from,
+    dst = to
+  )
+
+write_csv(nodes_for_gnn, "nodes_for_gnn.csv")
+write_csv(edges_for_gnn, "edges_for_gnn.csv")
+
+cat("Exported", nrow(nodes_for_gnn), "nodes and", nrow(edges_for_gnn), "edges for modeling.\n")
+```
+
+# Step 8 – Shiny Dashboard UI (8 Sections)
+
+```{r shiny-dashboard, echo=FALSE}
+# Step 8 – Shiny Dashboard UI (8 Sections)
+
+# Build nodes_df for UI
+nodes_df <- nodes_features %>%
+  arrange(recip_state, recip_county)
+
+# Safe degree range for slider
+deg_min <- min(nodes_df$degree, na.rm = TRUE)
+deg_max <- max(nodes_df$degree, na.rm = TRUE)
+if (!is.finite(deg_min)) deg_min <- 0
+if (!is.finite(deg_max)) deg_max <- max(nodes_df$degree, na.rm = TRUE)
+if (!is.finite(deg_max)) deg_max <- 10
+
+# Optional GNN results
+gnn_results <- NULL
+if (file.exists("gnn_results.csv")) {
+  gnn_results <- read_csv("gnn_results.csv", show_col_types = FALSE)
+  nodes_df <- nodes_df %>%
+    left_join(gnn_results, by = c("name" = "node_id"))
+  county_graph_sf <- county_graph_sf %>%
+    left_join(gnn_results, by = c("geoid" = "node_id"))
+}
+
+ui <- navbarPage(
+  title = div(
+    style = "display:flex; align-items:center; gap:10px;",
+    span("US County Vaccine Network Dashboard", style = "font-weight:600;"),
+    span("– STAT 636 : APPLIED MULTIVARIATE ANALYSIS ", style = "font-size:0.8em; color:#e0e0e0;")
+  ),
+  header = tagList(
+    tags$head(
+      tags$style(HTML("
+        body {
+          background-color: #f7f7f7;
+        }
+        .navbar-default {
+          background-color: #1b4965;
+          border-color: #1b4965;
+        }
+        .navbar-default .navbar-brand,
+        .navbar-default .navbar-nav > li > a {
+          color: #f8f9fa !important;
+        }
+        .navbar-default .navbar-nav > .active > a,
+        .navbar-default .navbar-nav > .active > a:focus,
+        .navbar-default .navbar-nav > .active > a:hover {
+          background-color: #ffb703 !important;
+          color: #003049 !important;
+        }
+        .navbar-default .navbar-nav > li > a:hover {
+          background-color: #264653 !important;
+          color: #f8f9fa !important;
+        }
+        .well, .panel {
+          background-color: #ffffff !important;
+          border-radius: 8px !important;
+          border: 1px solid #e0e0e0 !important;
+        }
+      "))
+    )
+  ),
+
+  # 1. County Explorer ------------------------------------------------------
+  tabPanel("1. County Explorer",
+           sidebarLayout(
+             sidebarPanel(
+               h4("Filter counties"),
+               selectInput(
+                 "state_sel",
+                 "Select state:",
+                 choices  = sort(unique(nodes_df$recip_state)),
+                 selected = "TX"
+               ),
+               uiOutput("county_sel_ui"),
+               sliderInput(
+                 "degree_range",
+                 "Filter by degree (number of neighbours):",
+                 min   = deg_min,
+                 max   = deg_max,
+                 value = c(deg_min, deg_max)
+               ),
+               br(),
+               helpText("Use the filters above to explore individual counties and their network context.")
+             ),
+             mainPanel(
+               h3("County overview"),
+               DTOutput("county_table"),
+               br(),
+               fluidRow(
+                 column(6,
+                        h4("State-wide vaccination % distribution"),
+                        plotOutput("state_hist", height = 250)
+                 ),
+                 column(6,
+                        h4("Degree vs vaccination % (selected state)"),
+                        plotOutput("state_scatter", height = 250)
+                 )
+               )
+             )
+           )),
+
+  # 2. Spatial Map ----------------------------------------------------------
+  tabPanel("2. Spatial Map",
+           sidebarLayout(
+             sidebarPanel(
+               h4("Spatial patterns"),
+               selectInput(
+                 "map_metric",
+                 "Map metric:",
+                 choices = c(
+                   "Vaccination % (series_complete)" = "vax_pct",
+                   "Booster % "                      = "booster_pct",
+                   "Neighbour mean vaccination %"    = "neighbour_mean_vax"
+                 ),
+                 selected = "vax_pct"
+               ),
+               checkboxInput("map_focus_state", "Filter to a single state", value = FALSE),
+               conditionalPanel(
+                 condition = "input.map_focus_state == true",
+                 selectInput(
+                   "map_state",
+                   "State for map:",
+                   choices = sort(unique(nodes_df$recip_state)),
+                   selected = "TX"
+                 )
+               ),
+               br(),
+               helpText("Hover over a county to see its name and vaccination percentage.")
+             ),
+             mainPanel(
+               leafletOutput("vax_map", height = 600)
+             )
+           )),
+
+  # 3. Network Graph --------------------------------------------------------
+  tabPanel("3. Network Graph",
+           sidebarLayout(
+             sidebarPanel(
+               h4("Network view"),
+               selectInput(
+                 "graph_color_by",
+                 "Color nodes by:",
+                 choices = c(
+                   "Vaccination %" = "vax_pct",
+                   "Booster %"     = "booster_pct",
+                   "Degree"        = "degree",
+                   "Community"     = "community"
+                 ),
+                 selected = "community"
+               ),
+               sliderInput(
+                 "graph_sample",
+                 "Subsample nodes for plotting:",
+                 min   = min(500, nrow(nodes_df)),
+                 max   = nrow(nodes_df),
+                 value = min(2000, nrow(nodes_df)),
+                 step  = 100
+               ),
+               br(),
+               helpText("Subsample nodes to keep the layout readable.")
+             ),
+             mainPanel(
+               h3("Force-directed county network"),
+               plotOutput("graph_plot", height = 600)
+             )
+           )),
+
+  # 4. Feature Explorer -----------------------------------------------------
+  tabPanel("4. Feature Explorer",
+           sidebarLayout(
+             sidebarPanel(
+               h4("Feature relationships"),
+               selectInput(
+                 "feat_x",
+                 "X-axis:",
+                 choices = c(
+                   "Degree"                        = "degree",
+                   "Vaccination % (vax_pct)"       = "vax_pct", 
+                   "Booster % (booster_pct)"       = "booster_pct",
+                   "Neighbour mean vax"            = "neighbour_mean_vax",
+                   "Population total"              = "pop_total"
+                 ),
+                 selected = "degree"
+               ),
+               selectInput(
+                 "feat_y",
+                 "Y-axis:",
+                 choices = c(
+                   "Vaccination % (vax_pct)"       = "vax_pct",
+                   "Booster % (booster_pct)"       = "booster_pct",
+                   "Neighbour mean vax"            = "neighbour_mean_vax"
+                 ),
+                 selected = "vax_pct"
+               ),
+               selectInput(
+                 "feat_color",
+                 "Color by:",
+                 choices = c(
+                   "None"          = "none",
+                   "SVI category"  = "svi_category",
+                   "Metro status"  = "metro_status",
+                   "Community"     = "community"
+                 ),
+                 selected = "none"
+               )
+             ),
+             mainPanel(
+               h3("Scatterplot of node-level features"),
+               plotOutput("feature_scatter", height = 400),
+               br(),
+               h4("Distribution of vaccination %"),
+               plotOutput("feature_hist", height = 250)
+             )
+           )),
+
+  # 5. Model & Forecast -----------------------------------------------------
+  tabPanel("5. Model & Forecast",
+           sidebarLayout(
+             sidebarPanel(
+               h4("Simple forecasting models"),
+               helpText("Compare a non-network baseline model with a network-aware model using neighbour_mean_vax."),
+               sliderInput(
+                 "train_frac",
+                 "Training fraction:",
+                 min   = 0.5,
+                 max   = 0.9,
+                 value = 0.8,
+                 step  = 0.05
+               ),
+               actionButton("run_models", "Run models")
+             ),
+             mainPanel(
+               h3("Model performance"),
+               tableOutput("model_perf_table"),
+               br(),
+               h4("Predicted vs actual vaccination % (network-aware model)"),
+               plotOutput("model_scatter", height = 350)
+             )
+           )),
+
+  # 6. Unobserved Counties Simulator ---------------------------------------
+  tabPanel("6. Unobserved Counties",
+           sidebarLayout(
+             sidebarPanel(
+               h4("Simulate missing counties"),
+               helpText("Hide a fraction of counties and compare global-mean vs neighbour-mean predictions."),
+               sliderInput(
+                 "hide_frac",
+                 "Fraction of counties treated as unobserved:",
+                 min   = 0.1,
+                 max   = 0.5,
+                 value = 0.2,
+                 step  = 0.05
+               ),
+               actionButton("run_sim", "Run simulation")
+             ),
+             mainPanel(
+               h3("Simulation results"),
+               tableOutput("sim_table"),
+               br(),
+               h4("Error distribution for hidden counties"),
+               plotOutput("sim_hist", height = 350)
+             )
+           )),
+
+  # 7. Insights & Summary ---------------------------------------------------
+  tabPanel("7. Insights & Summary",
+           fluidPage(
+             h3("Key insights from the network-based analysis"),
+             tags$ul(
+               tags$li("The county-level adjacency network reveals strong regional clustering in vaccination."),
+               tags$li("Neighbour mean vaccination is a strong predictor of a county's own coverage."),
+               tags$li("Network-aware models outperform non-network baselines when predicting vaccination levels."),
+               tags$li("The exported node and edge files are ready for graph neural network (GNN) experiments.")
+             ),
+             br(),
+             h4("Takeaway"),
+             p("Incorporating county network structure transforms this into a spatial-graph forecasting problem, where graph-aware models like GNNs can leverage neighbour information to improve predictions for under-reported or unobserved counties.")
+           )),
+
+  # 8. Downloads ------------------------------------------------------------
+  tabPanel("8. Downloads",
+           fluidPage(
+             h3("Exported data for further modeling"),
+             p("These files can be used in Python (e.g., PyTorch Geometric, DGL) or R for advanced GNN experiments."),
+             br(),
+             downloadButton("dl_nodes", "Download nodes_for_gnn.csv"),
+             br(), br(),
+             downloadButton("dl_edges", "Download edges_for_gnn.csv")
+           ))
+)
+
+server <- function(input, output, session) {
+
+  # 1. County Explorer ------------------------------------------------------
+  output$county_sel_ui <- renderUI({
+    req(input$state_sel)
+    counties_state <- nodes_df %>%
+      filter(recip_state == input$state_sel) %>%
+      arrange(recip_county)
+
+    selectInput(
+      "county_sel",
+      "Select county:",
+      choices  = unique(counties_state$recip_county),
+      selected = unique(counties_state$recip_county)[1]
+    )
+  })
+
+  filtered_state <- reactive({
+    nodes_df %>%
+      filter(
+        recip_state == input$state_sel,
+        degree >= input$degree_range[1],
+        degree <= input$degree_range[2]
+      )
+  })
+
+  output$county_table <- renderDT({
+    req(input$county_sel)
+    df <- filtered_state() %>%
+      filter(recip_county == input$county_sel) %>%
+      select(
+        State                    = recip_state,
+        County                   = recip_county,
+        `Vaccination %`          = vax_pct,
+        `Booster %`              = booster_pct,
+        `Neighbour mean vax %`   = neighbour_mean_vax,
+        Degree                   = degree,
+        Betweenness              = betweenness,
+        Closeness                = closeness,
+        `Total population`       = pop_total,
+        SVI                      = svi_category,
+        `Metro status`           = metro_status,
+        Community                = community
+      )
+    datatable(df, options = list(dom = "t", paging = FALSE))
+  })
+
+  output$state_hist <- renderPlot({
+    df <- filtered_state()
+    hist(df$vax_pct,
+         main = paste("Vaccination % in", input$state_sel),
+         xlab = "Series complete population %")
+  })
+
+  output$state_scatter <- renderPlot({
+    df <- filtered_state()
+    plot(df$degree, df$vax_pct,
+         xlab = "Degree",
+         ylab = "Vaccination %",
+         main = paste("Degree vs Vaccination % in", input$state_sel))
+  })
+
+  # 2. Spatial Map ----------------------------------------------------------
+  output$vax_map <- renderLeaflet({
+    df <- county_graph_sf
+    if (isTRUE(input$map_focus_state)) {
+      df <- df %>% filter(recip_state == input$map_state)
+    }
+
+    if (nrow(df) == 0) {
+      return(leaflet() %>% addTiles())
+    }
+
+    df <- df %>% st_transform(4326)
+
+    metric <- input$map_metric
+    if (!metric %in% names(df)) {
+      metric <- "vax_pct"
+    }
+
+    df$map_value <- df[[metric]]
+
+    pal_col <- colorNumeric("YlGnBu", domain = df$map_value, na.color = "#f0f0f0")
+
+    leaflet(df) %>%
+      addProviderTiles("CartoDB.Positron") %>%
+      addPolygons(
+        fillColor = ~ pal_col(map_value),
+        color     = "#444444",
+        weight    = 0.3,
+        opacity   = 1,
+        fillOpacity = 0.7,
+        highlightOptions = highlightOptions(weight = 1.5, color = "#666", bringToFront = TRUE),
+        label = ~ paste0(recip_county, ", ", recip_state, "<br>",
+                         "Vax %: ", round(vax_pct, 1)),
+        labelOptions = labelOptions(direction = "auto")
+      ) %>%
+      addLegend(
+        pal    = pal_col,
+        values = df$map_value,
+        title  = metric,
+        opacity = 0.7
+      )
+  })
+
+  # 3. Network Graph --------------------------------------------------------
+  output$graph_plot <- renderPlot({
+    req(input$graph_sample, input$graph_color_by)
+    set.seed(123)
+
+    tryCatch({
+      g_full   <- as.igraph(g_tbl)
+      all_ids  <- V(g_full)$name
+      n_sample <- min(input$graph_sample, length(all_ids))
+      keep_ids <- if (n_sample < length(all_ids)) sample(all_ids, n_sample) else all_ids
+      g_sub    <- induced_subgraph(g_full, vids = match(keep_ids, all_ids))
+
+      if (gorder(g_sub) == 0) {
+        plot.new(); text(0.5, 0.5, "No nodes available after sampling/filtering", cex = 1.1)
+        return(invisible(NULL))
+      }
+
+      g_sub_tbl <- as_tbl_graph(g_sub)
+      node_df   <- as_tibble(g_sub_tbl, active = "nodes")
+
+      color_var <- input$graph_color_by
+      if (!color_var %in% names(node_df)) {
+        color_var <- "degree"
+      }
+
+      p <- ggraph(g_sub_tbl, layout = "fr") +
+        geom_edge_link(alpha = 0.05) +
+        geom_node_point(aes_string(color = color_var), size = 1.5) +
+        theme_void() +
+        labs(
+          title = "County Vaccine Network — Force-directed layout",
+          subtitle = paste0(
+            "Nodes: ", gorder(g_sub_tbl),
+            " | Edges: ", gsize(as.igraph(g_sub_tbl)),
+            " | Color: ", color_var
+          )
+        )
+
+      print(p)
+
+    }, error = function(e) {
+      plot.new()
+      text(0.5, 0.5, paste("Plot error:", conditionMessage(e)), cex = 1, col = "red")
+    })
+  })
+
+  # 4. Feature Explorer -----------------------------------------------------
+  output$feature_scatter <- renderPlot({
+    df    <- nodes_df
+    xvar  <- input$feat_x
+    yvar  <- input$feat_y
+    colvar <- input$feat_color
+
+    if (!xvar %in% names(df) || !yvar %in% names(df)) {
+      plot.new(); text(0.5, 0.5, "Selected variables not found", col = "red"); return()
+    }
+
+    if (colvar == "none" || !colvar %in% names(df)) {
+      plot(df[[xvar]], df[[yvar]],
+           xlab = xvar,
+           ylab = yvar,
+           main = paste(yvar, "vs", xvar))
+    } else {
+      cols <- as.factor(df[[colvar]])
+      plot(df[[xvar]], df[[yvar]],
+           xlab = xvar,
+           ylab = yvar,
+           col  = cols,
+           pch  = 16,
+           main = paste(yvar, "vs", xvar, "colored by", colvar))
+      legend("topright", legend = levels(cols), col = 1:length(levels(cols)),
+             pch = 16, cex = 0.7)
+    }
+  })
+
+  output$feature_hist <- renderPlot({
+    hist(nodes_df$vax_pct,
+         main = "Distribution of vaccination % across all counties",
+         xlab = "Vaccination %")
+  })
+
+  # 5. Model & Forecast (simple models in R) --------------------------------
+  observeEvent(input$run_models, {
+    df <- nodes_df %>%
+      filter(!is.na(vax_pct),
+             !is.na(booster_pct),
+             !is.na(neighbour_mean_vax))
+
+    set.seed(123)
+    n       <- nrow(df)
+    train_n <- floor(input$train_frac * n)
+    idx     <- sample(seq_len(n), size = train_n)
+
+    train_df <- df[idx, ]
+    test_df  <- df[-idx, ]
+
+    baseline_mod <- lm(vax_pct ~ booster_pct + svi_category + metro_status + pop_total,
+                       data = train_df)
+    baseline_pred <- predict(baseline_mod, newdata = test_df)
+
+    network_mod <- lm(vax_pct ~ booster_pct + svi_category + metro_status + pop_total + neighbour_mean_vax,
+                      data = train_df)
+    network_pred <- predict(network_mod, newdata = test_df)
+
+    rmse <- function(truth, pred) sqrt(mean((truth - pred)^2, na.rm = TRUE))
+    baseline_rmse <- rmse(test_df$vax_pct, baseline_pred)
+    network_rmse  <- rmse(test_df$vax_pct, network_pred)
+
+    perf_tbl <- tibble(
+      Model = c("Baseline (no network)", "Network-aware (with neighbour_mean_vax)"),
+      RMSE  = c(baseline_rmse, network_rmse)
+    )
+
+    output$model_perf_table <- renderTable(perf_tbl, digits = 3)
+
+    output$model_scatter <- renderPlot({
+      plot(test_df$vax_pct, network_pred,
+           xlab = "Actual vaccination %",
+           ylab = "Predicted vaccination % (network-aware)",
+           main = "Predicted vs actual (network-aware model)")
+      abline(0, 1, col = "red", lwd = 2)
+    })
+  })
+
+  # 6. Unobserved Counties Simulator ----------------------------------------
+  observeEvent(input$run_sim, {
+    df <- nodes_df %>%
+      filter(!is.na(vax_pct))
+
+    set.seed(42)
+    n       <- nrow(df)
+    hide_n  <- floor(input$hide_frac * n)
+    hidden_idx <- sample(seq_len(n), size = hide_n)
+
+    df_hidden <- df[hidden_idx, ]
+    df_obs    <- df[-hidden_idx, ]
+
+    baseline_pred <- rep(mean(df_obs$vax_pct, na.rm = TRUE), nrow(df_hidden))
+
+    vax_vec_all <- df$vax_pct
+    names(vax_vec_all) <- df$name
+    g_all <- as.igraph(g_tbl)
+    neigh_list_all <- ego(g_all, order = 1, nodes = df_hidden$name, mode = "all")
+    network_pred <- purrr::map_dbl(neigh_list_all, function(nb) {
+      ids <- names(nb)
+      mean(vax_vec_all[ids], na.rm = TRUE)
+    })
+
+    rmse <- function(truth, pred) sqrt(mean((truth - pred)^2, na.rm = TRUE))
+    baseline_rmse <- rmse(df_hidden$vax_pct, baseline_pred)
+    network_rmse  <- rmse(df_hidden$vax_pct, network_pred)
+
+    sim_tbl <- tibble(
+      Model = c("Baseline (global mean)", "Network smoother (neighbour mean)"),
+      RMSE  = c(baseline_rmse, network_rmse)
+    )
+
+    output$sim_table <- renderTable(sim_tbl, digits = 3)
+
+    output$sim_hist <- renderPlot({
+      err_base <- df_hidden$vax_pct - baseline_pred
+      err_net  <- df_hidden$vax_pct - network_pred
+
+      hist(err_base,
+           col = rgb(1, 0, 0, 0.4),
+           xlab = "Prediction error (actual - predicted)",
+           main = "Error distribution for hidden counties")
+      hist(err_net,
+           col = rgb(0, 0, 1, 0.4),
+           add = TRUE)
+      legend("topright",
+             legend = c("Baseline", "Network smoother"),
+             fill   = c(rgb(1, 0, 0, 0.4), rgb(0, 0, 1, 0.4)))
+    })
+  })
+
+  # 8. Downloads ------------------------------------------------------------
+  output$dl_nodes <- downloadHandler(
+    filename = function() "nodes_for_gnn.csv",
+    content = function(file) {
+      write_csv(nodes_for_gnn, file)
+    }
+  )
+
+  output$dl_edges <- downloadHandler(
+    filename = function() "edges_for_gnn.csv",
+    content = function(file) {
+      write_csv(edges_for_gnn, file)
+    }
+  )
+}
+
+shinyApp(ui, server)
+```
+
