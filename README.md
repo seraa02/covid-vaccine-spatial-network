@@ -108,8 +108,6 @@ This project exports a **GNN-ready dataset** (`nodes.csv`, `edges.csv`) for futu
 
 👥 Team
 
-Name
-
  Saher Thekedar,
  Eduardo Macchi,
  Asmita Shivling Desai 
