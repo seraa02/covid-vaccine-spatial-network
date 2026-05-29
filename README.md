@@ -109,8 +109,9 @@ This project exports a **GNN-ready dataset** (`nodes.csv`, `edges.csv`) for futu
 👥 Team
 
 Name
- Saher Thekedar 
- Eduardo Macchi 
+
+ Saher Thekedar,
+ Eduardo Macchi,
  Asmita Shivling Desai 
 
 *Texas A&M University — STAT 636: Applied Multivariate Analysis*
